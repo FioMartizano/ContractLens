@@ -1,0 +1,23 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# React / Node
+node_modules/
+dist/
+
+# Uploaded contracts
+uploads/
+
+# ChromaDB
+chroma_db/
+
+# IDE
+.vscode/
+.idea/

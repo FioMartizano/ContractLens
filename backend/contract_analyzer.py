@@ -18,7 +18,7 @@ from vector_store import ensure_standard_clauses, retrieve_standard_clauses
 
 logger = logging.getLogger(__name__)
 load_dotenv(Path(__file__).resolve().parent / ".env")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 DISCLAIMER = (
     "AI-generated information for general review only; it is not legal advice. "
     "Have a qualified lawyer review important decisions."

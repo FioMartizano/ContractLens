@@ -2,6 +2,46 @@
 
 ## Run locally
 
+### Backend (Windows PowerShell)
+
+Use Python 3.12. Do not run the backend with Python 3.15.
+
+```powershell
+cd ..\backend
+
+py -3.12 -m venv .venv
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+python -m uvicorn main:app --reload --port 8000
+```
+
+The terminal prompt should begin with `(.venv)` after activation. The backend
+should remain running and serve `http://127.0.0.1:8000/api/health`.
+
+If an existing `.venv` is incomplete or has dependency conflicts, deactivate
+and recreate it from the `backend` directory:
+
+```powershell
+deactivate
+Remove-Item -Recurse -Force .venv
+py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --reload --port 8000
+```
+
+Do not use `python -m pip` before activating the virtual environment unless
+the command explicitly uses `.\.venv\Scripts\python.exe`.
+
+### Frontend
+
 Install the frontend dependencies and start Vite:
 
 ```sh

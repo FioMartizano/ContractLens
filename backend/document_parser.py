@@ -1,6 +1,7 @@
 
 import io
 import os
+import shutil
 from pathlib import Path
 
 import pdfplumber
@@ -13,10 +14,25 @@ from PIL import Image, UnidentifiedImageError
 # Load local environment variables from the backend folder
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-# Get the Tesseract executable path from the developer's .env file
-TESSERACT_EXE = os.getenv("TESSERACT_CMD")
+# Resolve Tesseract on this computer instead of reusing another developer's path.
+def _resolve_tesseract() -> str | None:
+    configured = os.getenv("TESSERACT_CMD", "").strip()
+    candidates = [
+        configured,
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        shutil.which("tesseract") or "",
+    ]
 
-# Configure Tesseract if a custom path was provided
+    for candidate in candidates:
+        if candidate:
+            candidate_path = Path(candidate)
+            if candidate_path.is_file():
+                return str(candidate_path)
+    return None
+
+
+TESSERACT_EXE = _resolve_tesseract()
 if TESSERACT_EXE:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
 
@@ -45,6 +61,13 @@ def extract_image_text(image_bytes: bytes):
     Extract text from an image using Tesseract OCR.
     Returns the same page-based structure as PDF extraction.
     """
+    if not TESSERACT_EXE:
+        raise ValueError(
+            "Tesseract OCR is not installed or could not be found on this backend "
+            "computer. Install Tesseract, then set TESSERACT_CMD to tesseract.exe "
+            "and restart the backend."
+        )
+
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
             image.load()
@@ -61,3 +84,12 @@ def extract_image_text(image_bytes: bytes):
 
     except UnidentifiedImageError as exc:
         raise ValueError("The uploaded file is not a valid image.") from exc
+    except pytesseract.TesseractNotFoundError as exc:
+        raise ValueError(
+            "Tesseract OCR is not installed or could not be found on this backend "
+            "computer."
+        ) from exc
+    except OSError as exc:
+        raise ValueError(
+            "Tesseract OCR could not start. Check TESSERACT_CMD and restart the backend."
+        ) from exc

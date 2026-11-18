@@ -15,7 +15,7 @@ from contract_analyzer import (
     AnalysisUnavailable,
     analyze_contract,
     compare_documents,
-    require_gemini_key,
+    require_groq_key,
 )
 from vector_store import (
     get_analysis,
@@ -133,7 +133,7 @@ async def extract_document(file: UploadFile = File(...)):
 @app.post("/api/documents")
 async def upload_document(file: UploadFile = File(...)):
     try:
-        require_gemini_key()
+        require_groq_key()
         filename, file_type, pages = await _extract_upload(file)
         total_characters = sum(len(page["text"]) for page in pages)
         if total_characters == 0:

@@ -8,7 +8,7 @@ import pdfplumber
 import pytesseract
 
 from dotenv import load_dotenv
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
 
 
 # Load local environment variables from the backend folder
@@ -72,9 +72,28 @@ def extract_image_text(image_bytes: bytes):
         with Image.open(io.BytesIO(image_bytes)) as image:
             image.load()
 
+            # Small screenshots often contain text that is too tiny for reliable OCR.
+            # Upscale first, then normalize contrast and sharpen character edges.
+            working = image.convert("RGB")
+            max_dimension = 2600
+            if max(working.size) < max_dimension:
+                scale = min(3.0, max_dimension / max(working.size))
+                working = working.resize(
+                    (round(working.width * scale), round(working.height * scale)),
+                    Image.Resampling.LANCZOS,
+                )
+
+            processed = ImageOps.grayscale(working)
+            processed = ImageOps.autocontrast(processed)
+            processed = ImageEnhance.Contrast(processed).enhance(1.35)
+            processed = processed.filter(ImageFilter.SHARPEN)
+
+            # Automatic page segmentation works better for mixed paragraphs and tables
+            # than assuming the entire image is one uniform text block.
             text = pytesseract.image_to_string(
-                image.convert("RGB"),
-                lang="eng"
+                processed,
+                lang="eng",
+                config="--oem 3 --psm 3",
             )
 
         return [{

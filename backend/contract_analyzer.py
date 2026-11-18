@@ -1,4 +1,7 @@
 import json
+import math
+import difflib
+import unicodedata
 import logging
 import os
 import re
@@ -7,8 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from google import genai
-from google.genai import types
+from groq import Groq
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 
@@ -18,7 +20,7 @@ from vector_store import ensure_standard_clauses, retrieve_standard_clauses
 
 logger = logging.getLogger(__name__)
 load_dotenv(Path(__file__).resolve().parent / ".env")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+MODEL_NAME = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 DISCLAIMER = (
     "AI-generated information for general review only; it is not legal advice. "
     "Have a qualified lawyer review important decisions."
@@ -58,80 +60,179 @@ class RiskResult(BaseModel):
     findings: list[RiskFinding]
 
 
-def require_gemini_key() -> str:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+def require_groq_key() -> str:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise AnalysisUnavailable(
-            "Set GEMINI_API_KEY in backend/.env to enable contract analysis."
+            "Set GROQ_API_KEY in backend/.env to enable contract analysis."
         )
     return api_key
 
 
+def _retry_delay_seconds(exc: Exception, attempt: int) -> int:
+    """Use Groq's suggested wait when present, with a small safety buffer."""
+    message = str(exc)
+    match = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*s", message, re.IGNORECASE)
+    exponential_delay = 2 ** (attempt + 1)
+    if not match:
+        return exponential_delay
+
+    provider_delay = math.ceil(float(match.group(1))) + 2
+    return max(exponential_delay, provider_delay)
+
+
 def _request_json(
-    client: genai.Client,
+    client: Groq,
     system_prompt: str,
     user_payload: dict[str, Any],
 ) -> dict[str, Any]:
+    max_attempts = 5
     last_error = None
 
-    for attempt in range(4):
+    for attempt in range(max_attempts):
         try:
-            response = client.models.generate_content(
+            response = client.chat.completions.create(
                 model=MODEL_NAME,
-                contents=json.dumps(user_payload, ensure_ascii=False),
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    response_mime_type="application/json",
-                ),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_payload, ensure_ascii=False),
+                    },
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.2,
             )
-            content = response.text
+
+            content = response.choices[0].message.content
             if not content:
                 raise AnalysisFailed("The AI returned an empty response.")
+
             result = json.loads(content)
             if not isinstance(result, dict):
                 raise AnalysisFailed("The AI returned an invalid JSON object.")
             return result
+
         except AnalysisFailed:
             raise
         except Exception as exc:
             last_error = exc
-            status_code = getattr(exc, "status_code", getattr(exc, "code", None))
+            status_code = getattr(exc, "status_code", None)
             message = str(exc).lower()
             error_name = exc.__class__.__name__.lower()
-            logger.exception("Gemini request or response parsing failed")
 
-            is_transient = status_code in (408, 429, 500, 502, 503, 504)
-            if is_transient and attempt < 3:
-                time.sleep(2 ** attempt)
+            is_auth_error = status_code in (401, 403)
+            is_transient = (
+                status_code in (408, 429, 500, 502, 503, 504)
+                or "timeout" in error_name
+                or "timeout" in message
+                or "connection" in error_name
+                or "network" in message
+                or "temporarily unavailable" in message
+            )
+
+            if is_transient and attempt < max_attempts - 1:
+                delay = _retry_delay_seconds(exc, attempt)
+                logger.warning(
+                    "Groq request failed on attempt %s/%s. Retrying in %s seconds. Error: %s",
+                    attempt + 1,
+                    max_attempts,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
                 continue
 
-            if status_code in (401, 403) or "api key" in message or "permission" in message:
-                raise AnalysisFailed(
-                    "Gemini authentication or access failed. Replace GEMINI_API_KEY in "
-                    "backend/.env and check the key and project permissions."
-                ) from exc
-            if status_code == 429 or "quota" in message or "rate" in message:
-                raise AnalysisFailed(
-                    "Gemini is rate-limited or the project has no remaining quota."
-                ) from exc
-            if status_code == 503 or "unavailable" in message or "high demand" in message:
-                raise AnalysisFailed(
-                    "Gemini is temporarily unavailable due to high demand. Please retry shortly."
-                ) from exc
-            if "timeout" in error_name or "timeout" in message:
-                raise AnalysisFailed("The Gemini request timed out. Try again in a few moments.") from exc
-            if "connection" in error_name or "network" in message:
-                raise AnalysisFailed("ContractLens could not connect to Gemini.") from exc
-            raise AnalysisFailed("The Gemini request failed.") from exc
+            logger.exception(
+                "Groq request or response parsing failed after %s attempt(s)",
+                attempt + 1,
+            )
 
-    raise AnalysisFailed("The Gemini request failed after retries.") from last_error
+            if is_auth_error or "api key" in message or "authentication" in message:
+                raise AnalysisUnavailable(
+                    "Groq authentication failed. Check GROQ_API_KEY in backend/.env."
+                ) from exc
+
+            if status_code == 429 or "rate limit" in message or "quota" in message:
+                raise AnalysisUnavailable(
+                    "Groq rate limit reached. Please wait before trying again."
+                ) from exc
+
+            if status_code in (500, 502, 503, 504) or "temporarily unavailable" in message:
+                raise AnalysisUnavailable(
+                    "Groq is temporarily unavailable. Please retry shortly."
+                ) from exc
+
+            if "timeout" in error_name or "timeout" in message:
+                raise AnalysisUnavailable(
+                    "The Groq request timed out. Try again in a few moments."
+                ) from exc
+
+            if "connection" in error_name or "network" in message:
+                raise AnalysisUnavailable(
+                    "ContractLens could not connect to Groq."
+                ) from exc
+
+            raise AnalysisFailed("The Groq request failed.") from exc
+
+    raise AnalysisUnavailable("The Groq request failed after retries.") from last_error
 
 
 def _normalized(text: str) -> str:
+    """Normalize whitespace and Unicode while preserving readable clause text."""
+    text = unicodedata.normalize("NFKC", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _page_chunks(text: str, chunk_size: int = 7000, overlap: int = 400) -> list[str]:
+def _verification_tokens(text: str) -> list[str]:
+    """Create comparison tokens tolerant of OCR punctuation and casing differences."""
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return re.findall(r"[a-z0-9]+", normalized)
+
+
+def _quote_is_verifiable(quote: str, source_text: str) -> bool:
+    """
+    Verify a AI quotation against extracted page text.
+
+    Exact matching is preferred. For longer quotations, token-level fuzzy matching
+    tolerates small OCR substitutions while still requiring a close, contiguous match.
+    Short quotations remain exact-match only to avoid accepting generic wording.
+    """
+    normalized_quote = _normalized(quote)
+    normalized_source = _normalized(source_text)
+    if not normalized_quote:
+        return False
+
+    if normalized_quote.casefold() in normalized_source.casefold():
+        return True
+
+    quote_tokens = _verification_tokens(quote)
+    source_tokens = _verification_tokens(source_text)
+
+    if len(quote_tokens) < 8 or not source_tokens:
+        return False
+
+    quote_length = len(quote_tokens)
+    min_window = max(1, round(quote_length * 0.88))
+    max_window = min(len(source_tokens), round(quote_length * 1.12))
+    matcher = difflib.SequenceMatcher(autojunk=False)
+
+    # Search windows close to the quotation's token length. A 0.90 threshold
+    # allows a few OCR character/word errors but rejects materially different text.
+    matcher.set_seq2(quote_tokens)
+    for start in range(len(source_tokens)):
+        remaining = len(source_tokens) - start
+        if remaining < min_window:
+            break
+        upper = min(max_window, remaining)
+        for window_length in range(min_window, upper + 1):
+            matcher.set_seq1(source_tokens[start:start + window_length])
+            if matcher.ratio() >= 0.90:
+                return True
+
+    return False
+
+def _page_chunks(text: str, chunk_size: int = 4000, overlap: int = 250) -> list[str]:
     chunks = []
     start = 0
     while start < len(text):
@@ -149,7 +250,7 @@ def _page_chunks(text: str, chunk_size: int = 7000, overlap: int = 400) -> list[
     return chunks
 
 
-def _extract_clauses(client: genai.Client, pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _extract_clauses(client: Groq, pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     system_prompt = (
         "Extract legally meaningful contract clauses from the supplied page text. "
         "Return JSON only with a top-level 'clauses' array. For each clause provide "
@@ -184,11 +285,17 @@ def _extract_clauses(client: genai.Client, pages: list[dict[str, Any]]) -> list[
                         f"The AI returned an invalid page reference for page {page_number}."
                     )
                 normalized_quote = _normalized(clause.text)
-                if not normalized_quote or normalized_quote not in _normalized(page_text):
-                    raise AnalysisFailed(
-                        f"An AI-generated clause quote could not be verified on page {page_number}."
+                if not _quote_is_verifiable(clause.text, page_text):
+                    logger.warning(
+                        "Could not verify extracted clause quote on page %s: %s",
+                        page_number,
+                        clause.text[:180],
                     )
-                identity = (page_number, normalized_quote)
+                    raise AnalysisFailed(
+                        f"An AI-generated clause quote could not be verified on page {page_number}. "
+                        "Try a clearer scan or a higher-resolution image."
+                    )
+                identity = (page_number, normalized_quote.casefold())
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -211,7 +318,7 @@ def _risk_level(score: int) -> str:
 
 
 def _assess_clauses(
-    client: genai.Client,
+    client: Groq,
     clauses: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     ensure_standard_clauses(STANDARD_CLAUSES)
@@ -232,7 +339,7 @@ def _assess_clauses(
         "is general information, not legal advice."
     )
     assessed = []
-    batch_size = 8
+    batch_size = 3
 
     for start in range(0, len(clauses), batch_size):
         batch = clauses[start : start + batch_size]
@@ -285,7 +392,7 @@ def analyze_contract(
     pages: list[dict[str, Any]],
     document_id: str,
 ) -> dict[str, Any]:
-    client = genai.Client(api_key=require_gemini_key())
+    client = Groq(api_key=require_groq_key(), timeout=60.0, max_retries=0)
     clauses = _extract_clauses(client, pages)
     if not clauses:
         raise AnalysisFailed("No contract clauses could be extracted from this document.")
@@ -307,7 +414,7 @@ def analyze_contract(
 
 
 def compare_analyses(
-    client: genai.Client,
+    client: Groq,
     first: dict[str, Any],
     second: dict[str, Any],
 ) -> dict[str, Any]:
@@ -373,5 +480,5 @@ def compare_documents(
     first: dict[str, Any],
     second: dict[str, Any],
 ) -> dict[str, Any]:
-    client = genai.Client(api_key=require_gemini_key())
+    client = Groq(api_key=require_groq_key(), timeout=60.0, max_retries=0)
     return compare_analyses(client, first, second)

@@ -236,6 +236,93 @@ function getApiError(payload: unknown, fallback: string): string {
     : fallback;
 }
 
+function createReportPdf(
+  reports: AnalysisResponse[],
+  Pdf: typeof import("jspdf").jsPDF,
+): import("jspdf").jsPDF {
+  const pdf = new Pdf({ format: "a4", unit: "mm" });
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pageHeight = pdf.internal.pageSize.getHeight();
+  const margin = 16;
+  const textWidth = pageWidth - margin * 2;
+  let y = margin;
+
+  const addText = (
+    text: string,
+    fontSize = 10,
+    bold = false,
+    color: [number, number, number] = [51, 65, 85],
+  ) => {
+    pdf.setFont("helvetica", bold ? "bold" : "normal");
+    pdf.setFontSize(fontSize);
+    pdf.setTextColor(...color);
+    const lines = pdf.splitTextToSize(text || "-", textWidth);
+    const lineHeight = fontSize * 0.45 + 1;
+    for (const line of lines) {
+      if (y + lineHeight > pageHeight - margin) {
+        pdf.addPage();
+        y = margin;
+      }
+      pdf.text(line, margin, y);
+      y += lineHeight;
+    }
+    y += 1.5;
+  };
+
+  addText("ContractLens Analysis Report", 20, true, [22, 32, 51]);
+  addText(`Generated ${new Date().toLocaleString()}`, 9, false, [100, 116, 139]);
+
+  for (const report of reports) {
+    y += 4;
+    addText(report.filename, 15, true, [22, 32, 51]);
+    addText(
+      `Overall risk: ${report.overall_score}/100  |  High: ${report.risk_counts.high}  |  Medium: ${report.risk_counts.medium}  |  Low: ${report.risk_counts.low}  |  ${report.total_pages} page(s)`,
+      10,
+      true,
+    );
+
+    for (const clause of report.clauses) {
+      y += 2;
+      const riskColor: [number, number, number] =
+        clause.risk_level === "high"
+          ? [185, 28, 28]
+          : clause.risk_level === "medium"
+            ? [180, 83, 9]
+            : [21, 128, 61];
+      addText(
+        `${clause.clause_type} - Page ${clause.page_number} - ${clause.risk_level.toUpperCase()} RISK (${clause.risk_score}/100)`,
+        12,
+        true,
+        riskColor,
+      );
+      addText(`Party obligated: ${clause.party_obligated}`);
+      addText(`Clause text: ${clause.text}`);
+      addText(`Explanation: ${clause.explanation}`);
+      addText(`Deviation: ${clause.deviation}`);
+      addText(`Suggested rewrite: ${clause.suggested_rewrite}`);
+      if (clause.standard_reference) {
+        addText(`Standard reference: ${clause.standard_reference.title}`);
+      }
+    }
+
+    y += 3;
+    addText(report.disclaimer, 9, false, [100, 116, 139]);
+  }
+
+  const pageCount = pdf.getNumberOfPages();
+  for (let page = 1; page <= pageCount; page += 1) {
+    pdf.setPage(page);
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(8);
+    pdf.setTextColor(100, 116, 139);
+    pdf.text(`Page ${page} of ${pageCount}`, pageWidth - margin, pageHeight - 8, {
+      align: "right",
+    });
+  }
+
+  return pdf;
+}
+
 type IconName =
   | "brand"
   | "grid"
@@ -897,6 +984,24 @@ function App() {
     }
   };
 
+  const handleExportReport = async () => {
+    const reports =
+      activeNav === "documents"
+        ? documents
+        : analysis
+          ? [analysis]
+          : [];
+    if (reports.length === 0) return;
+
+    const reportName =
+      reports.length === 1
+        ? reports[0].filename.replace(/\.[^/.]+$/, "")
+        : "contractlens-report";
+    const safeReportName = reportName.replace(/[<>:"/\\|?*]/g, "-").trim();
+    const { jsPDF: Pdf } = await import("jspdf");
+    createReportPdf(reports, Pdf).save(`${safeReportName || "contractlens-report"}-report.pdf`);
+  };
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${showMobileNav ? "open" : ""}`}>
@@ -1056,7 +1161,15 @@ function App() {
                       : "Upload a contract to extract clauses and review risk."}
                 </p>
               </div>
-              <button className="outline-button">
+              <button
+                className="outline-button"
+                onClick={handleExportReport}
+                disabled={
+                  activeNav === "library" ||
+                  activeNav === "compare" ||
+                  (activeNav === "documents" ? documents.length === 0 : !analysis)
+                }
+              >
                 <Icon name="download" size={17} />
                 Export report
               </button>
